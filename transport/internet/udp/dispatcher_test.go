@@ -34,8 +34,8 @@ func TestSameDestinationDispatching(t *testing.T) {
 	assert := With(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	uplinkReader, uplinkWriter := pipe.New()
-	downlinkReader, downlinkWriter := pipe.New()
+	uplinkReader, uplinkWriter := pipe.New(pipe.WithSizeLimit(1024))
+	downlinkReader, downlinkWriter := pipe.New(pipe.WithSizeLimit(1024))
 
 	go func() {
 		for {
@@ -72,5 +72,5 @@ func TestSameDestinationDispatching(t *testing.T) {
 	cancel()
 
 	assert(count, Equals, uint32(1))
-	assert(msgCount, Equals, uint32(6))
+	assert(atomic.LoadUint32(&msgCount), Equals, uint32(6))
 }

@@ -4,10 +4,11 @@ import (
 	"context"
 	"time"
 
+	"v2ray.com/core/common/task"
+
 	"v2ray.com/core"
 	"v2ray.com/core/common"
 	"v2ray.com/core/common/buf"
-	"v2ray.com/core/common/functions"
 	"v2ray.com/core/common/net"
 	"v2ray.com/core/common/protocol"
 	"v2ray.com/core/common/retry"
@@ -118,7 +119,7 @@ func (c *Client) Process(ctx context.Context, link *core.Link, dialer proxy.Dial
 		if err != nil {
 			return newError("failed to create UDP connection").Base(err)
 		}
-		defer udpConn.Close()
+		defer udpConn.Close() // nolint: errcheck
 		requestFunc = func() error {
 			defer timer.SetTimeout(p.Timeouts.DownlinkOnly)
 			return buf.Copy(link.Reader, buf.NewSequentialWriter(NewUDPWriter(request, udpConn)), buf.UpdateActivity(timer))
@@ -130,7 +131,8 @@ func (c *Client) Process(ctx context.Context, link *core.Link, dialer proxy.Dial
 		}
 	}
 
-	if err := signal.ExecuteParallel(ctx, requestFunc, functions.CloseOnSuccess(responseFunc, functions.Close(link.Writer))); err != nil {
+	var responseDonePost = task.Single(responseFunc, task.OnSuccess(task.Close(link.Writer)))
+	if err := task.Run(task.WithContext(ctx), task.Parallel(requestFunc, responseDonePost))(); err != nil {
 		return newError("connection ends").Base(err)
 	}
 

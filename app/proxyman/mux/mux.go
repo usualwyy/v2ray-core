@@ -16,7 +16,7 @@ import (
 	"v2ray.com/core/common/log"
 	"v2ray.com/core/common/net"
 	"v2ray.com/core/common/protocol"
-	"v2ray.com/core/common/signal"
+	"v2ray.com/core/common/signal/done"
 	"v2ray.com/core/proxy"
 	"v2ray.com/core/transport/pipe"
 )
@@ -51,7 +51,7 @@ func (m *ClientManager) Dispatch(ctx context.Context, link *core.Link) error {
 		}
 	}
 
-	client, err := NewClient(m.proxy, m.dialer, m)
+	client, err := NewClient(ctx, m.proxy, m.dialer, m)
 	if err != nil {
 		return newError("failed to create client").Base(err)
 	}
@@ -77,7 +77,7 @@ func (m *ClientManager) onClientFinish() {
 type Client struct {
 	sessionManager *SessionManager
 	link           core.Link
-	done           *signal.Done
+	done           *done.Instance
 	manager        *ClientManager
 	concurrency    uint32
 }
@@ -86,11 +86,13 @@ var muxCoolAddress = net.DomainAddress("v1.mux.cool")
 var muxCoolPort = net.Port(9527)
 
 // NewClient creates a new mux.Client.
-func NewClient(p proxy.Outbound, dialer proxy.Dialer, m *ClientManager) (*Client, error) {
+func NewClient(pctx context.Context, p proxy.Outbound, dialer proxy.Dialer, m *ClientManager) (*Client, error) {
 	ctx := proxy.ContextWithTarget(context.Background(), net.TCPDestination(muxCoolAddress, muxCoolPort))
 	ctx, cancel := context.WithCancel(ctx)
-	uplinkReader, upLinkWriter := pipe.New()
-	downlinkReader, downlinkWriter := pipe.New()
+
+	opts := pipe.OptionsFromContext(pctx)
+	uplinkReader, upLinkWriter := pipe.New(opts...)
+	downlinkReader, downlinkWriter := pipe.New(opts...)
 
 	c := &Client{
 		sessionManager: NewSessionManager(),
@@ -98,7 +100,7 @@ func NewClient(p proxy.Outbound, dialer proxy.Dialer, m *ClientManager) (*Client
 			Reader: downlinkReader,
 			Writer: upLinkWriter,
 		},
-		done:        signal.NewDone(),
+		done:        done.New(),
 		manager:     m,
 		concurrency: m.config.Concurrency,
 	}
@@ -131,8 +133,8 @@ func (m *Client) monitor() {
 		select {
 		case <-m.done.Wait():
 			m.sessionManager.Close()
-			common.Close(m.link.Writer)
-			pipe.CloseError(m.link.Reader)
+			common.Close(m.link.Writer)    // nolint: errcheck
+			pipe.CloseError(m.link.Reader) // nolint: errcheck
 			return
 		case <-timer.C:
 			size := m.sessionManager.Size()
@@ -165,14 +167,15 @@ func fetchInput(ctx context.Context, s *Session, output buf.Writer) {
 	}
 	s.transferType = transferType
 	writer := NewWriter(s.ID, dest, output, transferType)
-	defer s.Close()
-	defer writer.Close()
+	defer s.Close()      // nolint: errcheck
+	defer writer.Close() // nolint: errcheck
 
 	newError("dispatching request to ", dest).WithContext(ctx).WriteToLog()
 	if pReader, ok := s.input.(*pipe.Reader); ok {
 		if err := copyFirstPayload(pReader, writer); err != nil {
 			newError("failed to fetch first payload").Base(err).WithContext(ctx).WriteToLog()
 			writer.hasError = true
+			pipe.CloseError(s.input)
 			return
 		}
 	}
@@ -180,6 +183,7 @@ func fetchInput(ctx context.Context, s *Session, output buf.Writer) {
 	if err := buf.Copy(s.input, writer); err != nil {
 		newError("failed to fetch all input").Base(err).WithContext(ctx).WriteToLog()
 		writer.hasError = true
+		pipe.CloseError(s.input)
 		return
 	}
 }
@@ -307,8 +311,9 @@ func (s *Server) Dispatch(ctx context.Context, dest net.Destination) (*core.Link
 		return s.dispatcher.Dispatch(ctx, dest)
 	}
 
-	uplinkReader, uplinkWriter := pipe.New()
-	downlinkReader, downlinkWriter := pipe.New()
+	opts := pipe.OptionsFromContext(ctx)
+	uplinkReader, uplinkWriter := pipe.New(opts...)
+	downlinkReader, downlinkWriter := pipe.New(opts...)
 
 	worker := &ServerWorker{
 		dispatcher: s.dispatcher,
@@ -322,10 +327,12 @@ func (s *Server) Dispatch(ctx context.Context, dest net.Destination) (*core.Link
 	return &core.Link{Reader: downlinkReader, Writer: uplinkWriter}, nil
 }
 
+// Start implements common.Runnable.
 func (s *Server) Start() error {
 	return nil
 }
 
+// Close implements common.Closable.
 func (s *Server) Close() error {
 	return nil
 }
@@ -458,7 +465,7 @@ func (w *ServerWorker) run(ctx context.Context) {
 	input := w.link.Reader
 	reader := &buf.BufferedReader{Reader: input}
 
-	defer w.sessionManager.Close()
+	defer w.sessionManager.Close() // nolint: errcheck
 
 	for {
 		select {

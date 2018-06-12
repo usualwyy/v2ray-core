@@ -11,6 +11,7 @@ import (
 	"v2ray.com/core/common/buf"
 	"v2ray.com/core/common/net"
 	"v2ray.com/core/common/signal"
+	"v2ray.com/core/common/task"
 	"v2ray.com/core/proxy"
 	"v2ray.com/core/transport/internet"
 	"v2ray.com/core/transport/internet/udp"
@@ -68,17 +69,18 @@ func (d *DokodemoDoor) Process(ctx context.Context, network net.Network, conn in
 		return newError("unable to get destination")
 	}
 
+	plcy := d.policy()
 	ctx, cancel := context.WithCancel(ctx)
-	timer := signal.CancelAfterInactivity(ctx, cancel, d.policy().Timeouts.ConnectionIdle)
+	timer := signal.CancelAfterInactivity(ctx, cancel, plcy.Timeouts.ConnectionIdle)
 
+	ctx = core.ContextWithBufferPolicy(ctx, plcy.Buffer)
 	link, err := dispatcher.Dispatch(ctx, dest)
 	if err != nil {
 		return newError("failed to dispatch request").Base(err)
 	}
 
 	requestDone := func() error {
-		defer common.Close(link.Writer)
-		defer timer.SetTimeout(d.policy().Timeouts.DownlinkOnly)
+		defer timer.SetTimeout(plcy.Timeouts.DownlinkOnly)
 
 		chunkReader := buf.NewReader(conn)
 
@@ -90,7 +92,7 @@ func (d *DokodemoDoor) Process(ctx context.Context, network net.Network, conn in
 	}
 
 	responseDone := func() error {
-		defer timer.SetTimeout(d.policy().Timeouts.UplinkOnly)
+		defer timer.SetTimeout(plcy.Timeouts.UplinkOnly)
 
 		var writer buf.Writer
 		if network == net.Network_TCP {
@@ -116,7 +118,10 @@ func (d *DokodemoDoor) Process(ctx context.Context, network net.Network, conn in
 		return nil
 	}
 
-	if err := signal.ExecuteParallel(ctx, requestDone, responseDone); err != nil {
+	if err := task.Run(task.WithContext(ctx),
+		task.Parallel(
+			task.Single(requestDone, task.OnSuccess(task.Close(link.Writer))),
+			responseDone))(); err != nil {
 		pipe.CloseError(link.Reader)
 		pipe.CloseError(link.Writer)
 		return newError("connection ends").Base(err)

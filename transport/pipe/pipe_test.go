@@ -1,13 +1,13 @@
 package pipe_test
 
 import (
-	"context"
 	"io"
+	"sync"
 	"testing"
 	"time"
 
 	"v2ray.com/core/common/buf"
-	"v2ray.com/core/common/signal"
+	"v2ray.com/core/common/task"
 	. "v2ray.com/core/transport/pipe"
 	. "v2ray.com/ext/assert"
 )
@@ -15,7 +15,7 @@ import (
 func TestPipeReadWrite(t *testing.T) {
 	assert := With(t)
 
-	pReader, pWriter := New()
+	pReader, pWriter := New(WithSizeLimit(1024))
 	payload := []byte{'a', 'b', 'c', 'd'}
 	b := buf.New()
 	b.Write(payload)
@@ -29,7 +29,7 @@ func TestPipeReadWrite(t *testing.T) {
 func TestPipeCloseError(t *testing.T) {
 	assert := With(t)
 
-	pReader, pWriter := New()
+	pReader, pWriter := New(WithSizeLimit(1024))
 	payload := []byte{'a', 'b', 'c', 'd'}
 	b := buf.New()
 	b.Write(payload)
@@ -44,7 +44,7 @@ func TestPipeCloseError(t *testing.T) {
 func TestPipeClose(t *testing.T) {
 	assert := With(t)
 
-	pReader, pWriter := New()
+	pReader, pWriter := New(WithSizeLimit(1024))
 	payload := []byte{'a', 'b', 'c', 'd'}
 	b := buf.New()
 	b.Write(payload)
@@ -68,7 +68,7 @@ func TestPipeLimitZero(t *testing.T) {
 	bb.Write([]byte{'a', 'b'})
 	assert(pWriter.WriteMultiBuffer(buf.NewMultiBufferValue(bb)), IsNil)
 
-	err := signal.ExecuteParallel(context.Background(), func() error {
+	err := task.Run(task.Parallel(func() error {
 		b := buf.New()
 		b.Write([]byte{'c', 'd'})
 		return pWriter.WriteMultiBuffer(buf.NewMultiBufferValue(b))
@@ -87,7 +87,34 @@ func TestPipeLimitZero(t *testing.T) {
 		}
 		assert(rb.String(), Equals, "cd")
 		return nil
-	})
+	}))()
 
 	assert(err, IsNil)
+}
+
+func TestPipeWriteMultiThread(t *testing.T) {
+	assert := With(t)
+
+	pReader, pWriter := New(WithSizeLimit(0))
+
+	var wg sync.WaitGroup
+
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			b := buf.New()
+			b.AppendBytes('a', 'b', 'c', 'd')
+			pWriter.WriteMultiBuffer(buf.NewMultiBufferValue(b))
+			wg.Done()
+		}()
+	}
+
+	time.Sleep(time.Millisecond * 100)
+
+	pWriter.Close()
+	wg.Wait()
+
+	b, err := pReader.ReadMultiBuffer()
+	assert(err, IsNil)
+	assert(b[0].Bytes(), Equals, []byte{'a', 'b', 'c', 'd'})
 }
